@@ -1,67 +1,184 @@
 import cv2
+import json
+import time
 import socket
 import struct
-import time # 시계 도구 (타이머용)
-import board # 핀 번호 도구
-import adafruit_dht # 파란색 습도 센서 통역사
+import threading
+import re
 
-# 1. 습도 센서 개통 (17번 핀)
-# 라즈베리파이 5의 버그를 피하기 위해 use_pulseio=False 를 꼭 넣어줍니다.
-dhtDevice = adafruit_dht.DHT11(board.D17, use_pulseio=False)
+import serial
 
-# 2. A에게 전화 걸기
-client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server_ip = '10.42.0.1' # A 라즈베리파이의 IP 주소 (핫스팟 주소)
-port = 8080
-client_socket.connect((server_ip, port))
+# -----------------------------
+# [1] 설정
+# -----------------------------
+SERVER_IP = "10.42.0.1"   # 서버용 라즈베리파이 IP
+SERVER_PORT = 8080
 
-# 3. 카메라 켜기
-cap = cv2.VideoCapture(0)
-print("B(클라이언트): 🎥 조용히 감시를 시작합니다. (습도 45% 이상일 때만 A에게 알림)")
+CAM_INDEX = 0
+FRAME_W, FRAME_H = 320, 240
+JPEG_QUALITY = 80
 
-# 스톱워치를 누르고 현재 시간을 기억해둡니다.
-last_check_time = time.time()
-is_emergency = False # 지금 비상 상황인가요? (처음엔 False)
+# STM32 -> Raspberry Pi (UART)
+SERIAL_PORT = "/dev/ttyUSB0"  # 환경에 따라 /dev/serial0, /dev/ttyAMA0 등으로 변경
+SERIAL_BAUD = 115200
+SERIAL_TIMEOUT = 0.1
 
-while True:
-    ret, frame = cap.read()
-    if not ret: break
-    
-    current_time = time.time() # 지금 몇 시인지 시계를 봅니다.
-    
-    # 4. 2초마다 한 번씩 몰래 습도 확인하기
-    if current_time - last_check_time >= 2.0:
-        last_check_time = current_time # 다음 2초를 위해 스톱워치를 다시 누릅니다.
-        
+# STM32에서 "🚨 추락감지 🚨" 수신 시 이 시간 동안 emergency=True 전송
+EMERGENCY_SIGNAL_HOLD_SEC = 1.5
+
+# header: (uint64 frame_size, bool is_emergency, uint32 sensor_json_size)
+HEADER_FMT = "<Q?I"
+
+
+# -----------------------------
+# [2] UART 데이터 공유 상태
+# -----------------------------
+sensor_lock = threading.Lock()
+latest_sensor = {
+    "source": "stm32",
+    "accel_raw": None,
+    "gyro_raw": None,
+    "svm": None,
+    "message": None,
+    "line_ts": None,
+}
+emergency_until = 0.0
+
+
+def parse_stm32_line(line: str):
+    """STM32에서 온 한 줄 문자열을 파싱해서 센서 상태를 업데이트한다."""
+    global emergency_until
+
+    now = time.time()
+
+    with sensor_lock:
+        latest_sensor["message"] = line
+        latest_sensor["line_ts"] = now
+
+        if "추락감지" in line:
+            emergency_until = max(emergency_until, now + EMERGENCY_SIGNAL_HOLD_SEC)
+            return
+
+        # 예: Acc: 123, -45, 16000 | Gyro: 12, -5, 30
+        m = re.search(
+            r"Acc:\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\|\s*Gyro:\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)",
+            line,
+        )
+        if m:
+            ax, ay, az, gx, gy, gz = map(int, m.groups())
+            latest_sensor["accel_raw"] = {"x": ax, "y": ay, "z": az}
+            latest_sensor["gyro_raw"] = {"x": gx, "y": gy, "z": gz}
+
+            # STM32 코드와 동일한 계산식(svm = sqrt((ax/16384)^2 + ...))
+            f_ax, f_ay, f_az = ax / 16384.0, ay / 16384.0, az / 16384.0
+            latest_sensor["svm"] = (f_ax * f_ax + f_ay * f_ay + f_az * f_az) ** 0.5
+
+
+# -----------------------------
+# [3] UART 수신 스레드
+# -----------------------------
+def stm32_reader_thread():
+    while True:
         try:
-            humidity = dhtDevice.humidity # 센서에게 습도 값을 물어봅니다.
-            
-            if humidity is not None:
-                # 💡 오직 습도가 45 이상일 때만 반응합니다!
-                if humidity >= 45:
-                    if not is_emergency: # 처음 45%를 넘었을 때 딱 한 번만 화면에 경고를 띄웁니다.
-                        print("🚨 [비상] 습도 45% 돌파! A서버 송장에 빨간 스티커를 붙입니다!")
-                    is_emergency = True # A에게 보낼 송장에 "비상(True)!!" 표시를 합니다.
-                else:
-                    is_emergency = False # 습도가 45 미만이면 다시 평화 상태(False)로 돌립니다.
-        except Exception as e:
-            # 센서가 가끔 값을 못 읽어도, 카메라 영상은 끊기면 안 되므로 쿨하게 무시하고 넘어갑니다.
-            pass 
-    
-    # 5. 영상 압축하기 (데이터 다이어트)
-    frame = cv2.resize(frame, (320, 240))
-    result, encoded_frame = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-    data = encoded_frame.tobytes()
-    
-    # 6. 택배 보내기
-    # 9바이트짜리 특수 송장에 (사진 용량, 비상상황True/False) 두 가지를 함께 포장합니다.
-    header = struct.pack("<Q?", len(data), is_emergency)
-    
-    # A에게 송장(header)을 먼저 보내고, 이어서 사진(data)을 와다다다 보냅니다.
-    client_socket.sendall(header)
-    client_socket.sendall(data)
+            ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=SERIAL_TIMEOUT)
+            print(f"[CLIENT] STM32 UART 연결됨: {SERIAL_PORT} @ {SERIAL_BAUD}")
 
-# 뒷정리
-cap.release()
-client_socket.close()
-dhtDevice.exit() # 센서도 깔끔하게 끕니다.
+            while True:
+                raw = ser.readline()
+                if not raw:
+                    continue
+
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+
+                parse_stm32_line(line)
+
+        except Exception as e:
+            print(f"[CLIENT] STM32 UART 오류: {e} (1초 후 재시도)")
+            time.sleep(1)
+
+
+# -----------------------------
+# [4] 서버 연결 유틸
+# -----------------------------
+def connect_server() -> socket.socket:
+    while True:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((SERVER_IP, SERVER_PORT))
+            print(f"[CLIENT] 서버 연결됨: {SERVER_IP}:{SERVER_PORT}")
+            return sock
+        except Exception as e:
+            print(f"[CLIENT] 서버 연결 실패: {e} (1초 후 재시도)")
+            time.sleep(1)
+
+
+# -----------------------------
+# [5] 메인: 영상 + 센서데이터 전송
+# -----------------------------
+def main():
+    threading.Thread(target=stm32_reader_thread, daemon=True).start()
+
+    cap = cv2.VideoCapture(CAM_INDEX)
+    if not cap.isOpened():
+        print("[CLIENT] 카메라 열기 실패")
+        return
+
+    sock = connect_server()
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("[CLIENT] 카메라 프레임 읽기 실패")
+                time.sleep(0.1)
+                continue
+
+            frame = cv2.resize(frame, (FRAME_W, FRAME_H))
+            ok, encoded = cv2.imencode(
+                ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+            )
+            if not ok:
+                continue
+            frame_bytes = encoded.tobytes()
+
+            now = time.time()
+            with sensor_lock:
+                is_emergency = now < emergency_until
+                sensor_payload = {
+                    "source": "stm32",
+                    "is_emergency_by_stm32": is_emergency,
+                    "accel_raw": latest_sensor["accel_raw"],
+                    "gyro_raw": latest_sensor["gyro_raw"],
+                    "svm": latest_sensor["svm"],
+                    "message": latest_sensor["message"],
+                    "line_ts": latest_sensor["line_ts"],
+                    "send_ts": now,
+                }
+
+            sensor_bytes = json.dumps(sensor_payload, ensure_ascii=False).encode("utf-8")
+            header = struct.pack(HEADER_FMT, len(frame_bytes), is_emergency, len(sensor_bytes))
+
+            try:
+                sock.sendall(header)
+                sock.sendall(sensor_bytes)
+                sock.sendall(frame_bytes)
+            except Exception:
+                print("[CLIENT] 서버 송신 실패 -> 재연결")
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                sock = connect_server()
+
+    finally:
+        cap.release()
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
