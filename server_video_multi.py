@@ -151,7 +151,7 @@ def handle_client(client_socket: socket.socket, addr):
             if sensor_size > 0:
                 sensor_raw = recv_exact(client_socket, sensor_size)
                 if not sensor_raw:
-                    print(f"[{client_id}] 센서데이터 수신 중 연 종료")
+                    print(f"[{client_id}] 센서데이터 수신 중 연결 종료")
                     break
                 try:
                     sensor_data = json.loads(sensor_raw.decode("utf-8"))
