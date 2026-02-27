@@ -1,189 +1,229 @@
-import os
 import cv2
 import json
 import time
 import socket
 import struct
-import subprocess
 import threading
-import queue
-import numpy as np
+import re
+from collections import deque
+
+import serial
 
 # -----------------------------
 # [1] 설정
 # -----------------------------
-HOST = "0.0.0.0"
-PORT = 8080
+SERVER_IP = "10.42.0.1"
+SERVER_PORT = 8080
 
-OUT_DIR = "/home/pi/events"
-os.makedirs(OUT_DIR, exist_ok=True)
-SENSOR_LOG_PATH = os.path.join(OUT_DIR, "sensor_data.log")
+SERIAL_PORT = "/dev/ttyUSB0"  # 블루투스 시리얼 포트에 맞게 변경
+SERIAL_BAUD = 115200
+SERIAL_TIMEOUT = 0.1
 
-DEFAULT_FPS = 10
-TARGET_W, TARGET_H = 640, 480
-USE_MP4 = True
+CAM_INDEX = 0
+FPS = 10
+SECONDS_BEFORE = 10
+SECONDS_AFTER = 10
+MAX_FRAMES_BEFORE = FPS * SECONDS_BEFORE
+MAX_FRAMES_AFTER = FPS * SECONDS_AFTER
+
+FRAME_W, FRAME_H = 640, 480
+JPEG_QUALITY = 85
 
 # 메시지 타입
 MSG_CLIP_START = 1
 MSG_FRAME = 2
 MSG_CLIP_END = 3
 
-sensor_log_lock = threading.Lock()
-play_queue: "queue.Queue[str]" = queue.Queue()
+
+# -----------------------------
+# [2] 공유 상태 (STM32 센서)
+# -----------------------------
+sensor_lock = threading.Lock()
+last_sensor = {
+    "source": "stm32",
+    "message": None,
+    "accel_raw": None,
+    "gyro_raw": None,
+    "svm": None,
+    "ts": None,
+}
+
+# 낙하 감지 이벤트 큐(중복 트리거 방지용 timestamp)
+pending_event = threading.Event()
 
 
-def recv_exact(sock: socket.socket, n: int) -> bytes:
-    data = bytearray()
-    while len(data) < n:
-        chunk = sock.recv(n - len(data))
-        if not chunk:
-            return b""
-        data.extend(chunk)
-    return bytes(data)
+def parse_stm32_line(line: str):
+    now = time.time()
+
+    with sensor_lock:
+        last_sensor["message"] = line
+        last_sensor["ts"] = now
+
+        m = re.search(
+            r"Acc:\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\|\s*Gyro:\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)",
+            line,
+        )
+        if m:
+            ax, ay, az, gx, gy, gz = map(int, m.groups())
+            last_sensor["accel_raw"] = {"x": ax, "y": ay, "z": az}
+            last_sensor["gyro_raw"] = {"x": gx, "y": gy, "z": gz}
+            fx, fy, fz = ax / 16384.0, ay / 16384.0, az / 16384.0
+            last_sensor["svm"] = (fx * fx + fy * fy + fz * fz) ** 0.5
+
+        # STM32 코드에서 보내는 비상 문자열
+        if "추락감지" in line:
+            pending_event.set()
+            print(f"[CLIENT] 🚨 낙하감지 수신: {line}")
 
 
-def play_video(path: str):
-    os.environ.setdefault("DISPLAY", ":0")
-    subprocess.run(["cvlc", "--play-and-exit", "--fullscreen", path], check=False)
-
-
-def player_worker():
+def stm32_reader_thread():
     while True:
-        path = play_queue.get()
         try:
-            play_video(path)
-        except Exception as e:
-            print(f"[PLAYER] 자동 재생 실패: {e}")
-        finally:
-            play_queue.task_done()
+            ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=SERIAL_TIMEOUT)
+            print(f"[CLIENT] STM32 시리얼 연결됨: {SERIAL_PORT} @ {SERIAL_BAUD}")
 
-
-def append_sensor_log(client_id: str, meta: dict):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    line = f"{ts}\t{client_id}\t{json.dumps(meta, ensure_ascii=False)}\n"
-    with sensor_log_lock:
-        with open(SENSOR_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(line)
-
-
-def build_output_path(client_id: str) -> str:
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    ext = "mp4" if USE_MP4 else "avi"
-    return os.path.join(OUT_DIR, f"emergency_{client_id}_{ts}.{ext}")
-
-
-def save_clip(path: str, fps: int, frames: list):
-    fourcc = cv2.VideoWriter_fourcc(*("mp4v" if USE_MP4 else "XVID"))
-    out = cv2.VideoWriter(path, fourcc, fps, (TARGET_W, TARGET_H))
-    for frame in frames:
-        out.write(frame)
-    out.release()
-
-
-def decode_jpeg_to_frame(jpg_bytes: bytes):
-    frame = cv2.imdecode(np.frombuffer(jpg_bytes, np.uint8), cv2.IMREAD_COLOR)
-    if frame is None:
-        return None
-    if (frame.shape[1], frame.shape[0]) != (TARGET_W, TARGET_H):
-        frame = cv2.resize(frame, (TARGET_W, TARGET_H))
-    return frame
-
-
-def handle_client(client_socket: socket.socket, addr):
-    client_id = f"{addr[0].replace('.', '_')}_{addr[1]}"
-    print(f"[{client_id}] 연결됨")
-
-    clip_meta = None
-    clip_frames = []
-
-    try:
-        while True:
-            msg_type_raw = recv_exact(client_socket, 1)
-            if not msg_type_raw:
-                print(f"[{client_id}] 연결 종료")
-                break
-
-            msg_type = struct.unpack("<B", msg_type_raw)[0]
-
-            if msg_type == MSG_CLIP_START:
-                size_raw = recv_exact(client_socket, 4)
-                if not size_raw:
-                    break
-                meta_size = struct.unpack("<I", size_raw)[0]
-                meta_raw = recv_exact(client_socket, meta_size)
-                if not meta_raw:
-                    break
-
-                try:
-                    clip_meta = json.loads(meta_raw.decode("utf-8"))
-                except Exception:
-                    clip_meta = {"raw": meta_raw.decode("utf-8", errors="replace")}
-
-                clip_frames = []
-                append_sensor_log(client_id, clip_meta)
-                print(f"[{client_id}] 이벤트 수신 시작: {clip_meta.get('event')} / target={clip_meta.get('total_frames')}")
-
-            elif msg_type == MSG_FRAME:
-                size_raw = recv_exact(client_socket, 4)
-                if not size_raw:
-                    break
-                jpg_size = struct.unpack("<I", size_raw)[0]
-                jpg = recv_exact(client_socket, jpg_size)
-                if not jpg:
-                    break
-
-                frame = decode_jpeg_to_frame(jpg)
-                if frame is not None:
-                    clip_frames.append(frame)
-
-            elif msg_type == MSG_CLIP_END:
-                if not clip_frames:
-                    print(f"[{client_id}] clip_end 수신했지만 프레임 없음")
+            while True:
+                raw = ser.readline()
+                if not raw:
                     continue
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                parse_stm32_line(line)
 
-                fps = int((clip_meta or {}).get("fps", DEFAULT_FPS))
-                out_path = build_output_path(client_id)
+        except Exception as e:
+            print(f"[CLIENT] STM32 연결 오류: {e} (1초 후 재시도)")
+            time.sleep(1)
 
-                print(f"[{client_id}] 저장 중... {out_path} (frames={len(clip_frames)})")
-                save_clip(out_path, fps, clip_frames)
-                print(f"[{client_id}] ✅ 저장 완료")
 
-                play_queue.put(out_path)
+def connect_server() -> socket.socket:
+    while True:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((SERVER_IP, SERVER_PORT))
+            print(f"[CLIENT] 서버 연결됨: {SERVER_IP}:{SERVER_PORT}")
+            return sock
+        except Exception as e:
+            print(f"[CLIENT] 서버 연결 실패: {e} (1초 후 재시도)")
+            time.sleep(1)
 
-                clip_meta = None
-                clip_frames = []
 
-            else:
-                print(f"[{client_id}] 알 수 없는 메시지 타입: {msg_type}")
-                break
+def send_clip(sock: socket.socket, frames: list[bytes], sensor_snapshot: dict):
+    meta = {
+        "event": "fall_detected",
+        "fps": FPS,
+        "width": FRAME_W,
+        "height": FRAME_H,
+        "seconds_before": SECONDS_BEFORE,
+        "seconds_after": SECONDS_AFTER,
+        "total_frames": len(frames),
+        "sensor": sensor_snapshot,
+        "client_ts": time.time(),
+    }
+    meta_bytes = json.dumps(meta, ensure_ascii=False).encode("utf-8")
 
-    except Exception as e:
-        print(f"[{client_id}] 에러: {e}")
-    finally:
-        client_socket.close()
-        print(f"[{client_id}] 스레드 종료")
+    sock.sendall(struct.pack("<BI", MSG_CLIP_START, len(meta_bytes)))
+    sock.sendall(meta_bytes)
+
+    for jpg in frames:
+        sock.sendall(struct.pack("<BI", MSG_FRAME, len(jpg)))
+        sock.sendall(jpg)
+
+    sock.sendall(struct.pack("<B", MSG_CLIP_END))
 
 
 def main():
-    threading.Thread(target=player_worker, daemon=True).start()
+    threading.Thread(target=stm32_reader_thread, daemon=True).start()
 
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind((HOST, PORT))
-    server_socket.listen(32)
+    cap = cv2.VideoCapture(CAM_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+    cap.set(cv2.CAP_PROP_FPS, FPS)
 
-    print(f"[SERVER] {HOST}:{PORT} 멀티클라이언트 대기 중")
-    print(f"[SERVER] 센서 로그 파일: {SENSOR_LOG_PATH}")
+    if not cap.isOpened():
+        print("[CLIENT] 카메라 열기 실패")
+        return
+
+    sock = connect_server()
+
+    before_buffer = deque(maxlen=MAX_FRAMES_BEFORE)
 
     try:
         while True:
-            client_socket, addr = server_socket.accept()
-            t = threading.Thread(target=handle_client, args=(client_socket, addr), daemon=True)
-            t.start()
-    except KeyboardInterrupt:
-        print("\n[SERVER] 종료")
+            ret, frame = cap.read()
+            if not ret:
+                print("[CLIENT] 카메라 프레임 읽기 실패")
+                time.sleep(0.1)
+                continue
+
+            frame = cv2.resize(frame, (FRAME_W, FRAME_H))
+            ok, encoded = cv2.imencode(
+                ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+            )
+            if not ok:
+                continue
+
+            jpg = encoded.tobytes()
+            before_buffer.append(jpg)
+
+            # 이벤트 발생 시점: 10초 전 버퍼 + 10초 후 수집 후 전송
+            if pending_event.is_set():
+                pending_event.clear()
+
+                with sensor_lock:
+                    sensor_snapshot = dict(last_sensor)
+
+                print("[CLIENT] 이벤트 처리 시작: 10초 전 + 10초 후 클립 생성")
+                clip_frames = list(before_buffer)
+
+                after_collected = 0
+                while after_collected < MAX_FRAMES_AFTER:
+                    ret2, frame2 = cap.read()
+                    if not ret2:
+                        time.sleep(0.05)
+                        continue
+
+                    frame2 = cv2.resize(frame2, (FRAME_W, FRAME_H))
+                    ok2, encoded2 = cv2.imencode(
+                        ".jpg", frame2, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+                    )
+                    if not ok2:
+                        continue
+
+                    jpg2 = encoded2.tobytes()
+                    clip_frames.append(jpg2)
+                    before_buffer.append(jpg2)
+                    after_collected += 1
+
+                # 클립 전송 (실패시 재연결 후 재시도 1회)
+                sent = False
+                for _ in range(2):
+                    try:
+                        send_clip(sock, clip_frames, sensor_snapshot)
+                        sent = True
+                        break
+                    except Exception as e:
+                        print(f"[CLIENT] 클립 전송 실패: {e} -> 재연결")
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
+                        sock = connect_server()
+
+                if sent:
+                    print(f"[CLIENT] ✅ 클립 전송 완료 (frames={len(clip_frames)})")
+                else:
+                    print("[CLIENT] ❌ 클립 전송 최종 실패")
+
+            # 너무 빠른 루프 방지
+            time.sleep(1.0 / FPS)
+
     finally:
-        server_socket.close()
+        cap.release()
+        try:
+            sock.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
