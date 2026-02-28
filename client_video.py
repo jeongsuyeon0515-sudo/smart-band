@@ -1,67 +1,237 @@
 import cv2
+import json
+import time
 import socket
 import struct
-import time # 시계 도구 (타이머용)
-import board # 핀 번호 도구
-import adafruit_dht # 파란색 습도 센서 통역사
+import threading
+import re
+from collections import deque
 
-# 1. 습도 센서 개통 (17번 핀)
-# 라즈베리파이 5의 버그를 피하기 위해 use_pulseio=False 를 꼭 넣어줍니다.
-dhtDevice = adafruit_dht.DHT11(board.D17, use_pulseio=False)
+import serial
 
-# 2. A에게 전화 걸기
-client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server_ip = '10.42.0.1' # A 라즈베리파이의 IP 주소 (핫스팟 주소)
-port = 8080
-client_socket.connect((server_ip, port))
+# -----------------------------
+# [1] 설정
+# -----------------------------
+SERVER_IP = "10.42.0.1"
+SERVER_PORT = 8080
 
-# 3. 카메라 켜기
-cap = cv2.VideoCapture(0)
-print("B(클라이언트): 🎥 조용히 감시를 시작합니다. (습도 45% 이상일 때만 A에게 알림)")
+SERIAL_PORT = "/dev/ttyUSB0"  # 블루투스 시리얼 포트에 맞게 변경
+SERIAL_BAUD = 115200
+SERIAL_TIMEOUT = 0.1
 
-# 스톱워치를 누르고 현재 시간을 기억해둡니다.
-last_check_time = time.time()
-is_emergency = False # 지금 비상 상황인가요? (처음엔 False)
+CAM_INDEX = 0
+FPS = 30
+SECONDS_BEFORE = 10
+SECONDS_AFTER = 10
+MAX_FRAMES_BEFORE = FPS * SECONDS_BEFORE
+MAX_FRAMES_AFTER = FPS * SECONDS_AFTER
 
-while True:
-    ret, frame = cap.read()
-    if not ret: break
-    
-    current_time = time.time() # 지금 몇 시인지 시계를 봅니다.
-    
-    # 4. 2초마다 한 번씩 몰래 습도 확인하기
-    if current_time - last_check_time >= 2.0:
-        last_check_time = current_time # 다음 2초를 위해 스톱워치를 다시 누릅니다.
-        
+FRAME_W, FRAME_H = 640, 480
+JPEG_QUALITY = 85
+
+# 메시지 타입
+MSG_CLIP_START = 1
+MSG_FRAME = 2
+MSG_CLIP_END = 3
+
+
+# -----------------------------
+# [2] 공유 상태 (STM32 센서)
+# -----------------------------
+sensor_lock = threading.Lock()
+last_sensor = {
+    "source": "stm32",
+    "message": None,
+    "accel_raw": None,
+    "gyro_raw": None,
+    "svm": None,
+    "ts": None,
+}
+
+# 낙하 감지 이벤트 큐(중복 트리거 방지용 timestamp)
+pending_event = threading.Event()
+
+
+def parse_stm32_line(line: str):
+    now = time.time()
+
+    with sensor_lock:
+        last_sensor["message"] = line
+        last_sensor["ts"] = now
+
+        m = re.search(
+            r"Acc:\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\|\s*Gyro:\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)",
+            line,
+        )
+        if m:
+            ax, ay, az, gx, gy, gz = map(int, m.groups())
+            last_sensor["accel_raw"] = {"x": ax, "y": ay, "z": az}
+            last_sensor["gyro_raw"] = {"x": gx, "y": gy, "z": gz}
+            fx, fy, fz = ax / 16384.0, ay / 16384.0, az / 16384.0
+            last_sensor["svm"] = (fx * fx + fy * fy + fz * fz) ** 0.5
+
+        # STM32 코드에서 보내는 비상 문자열
+        if "추락감지" in line:
+            pending_event.set()
+            print(f"[CLIENT] 🚨 낙하감지 수신: {line}")
+
+
+def stm32_reader_thread():
+    while True:
         try:
-            humidity = dhtDevice.humidity # 센서에게 습도 값을 물어봅니다.
-            
-            if humidity is not None:
-                # 💡 오직 습도가 45 이상일 때만 반응합니다!
-                if humidity >= 45:
-                    if not is_emergency: # 처음 45%를 넘었을 때 딱 한 번만 화면에 경고를 띄웁니다.
-                        print("🚨 [비상] 습도 45% 돌파! A서버 송장에 빨간 스티커를 붙입니다!")
-                    is_emergency = True # A에게 보낼 송장에 "비상(True)!!" 표시를 합니다.
-                else:
-                    is_emergency = False # 습도가 45 미만이면 다시 평화 상태(False)로 돌립니다.
-        except Exception as e:
-            # 센서가 가끔 값을 못 읽어도, 카메라 영상은 끊기면 안 되므로 쿨하게 무시하고 넘어갑니다.
-            pass 
-    
-    # 5. 영상 압축하기 (데이터 다이어트)
-    frame = cv2.resize(frame, (320, 240))
-    result, encoded_frame = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-    data = encoded_frame.tobytes()
-    
-    # 6. 택배 보내기
-    # 9바이트짜리 특수 송장에 (사진 용량, 비상상황True/False) 두 가지를 함께 포장합니다.
-    header = struct.pack("<Q?", len(data), is_emergency)
-    
-    # A에게 송장(header)을 먼저 보내고, 이어서 사진(data)을 와다다다 보냅니다.
-    client_socket.sendall(header)
-    client_socket.sendall(data)
+            ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=SERIAL_TIMEOUT)
+            print(f"[CLIENT] STM32 시리얼 연결됨: {SERIAL_PORT} @ {SERIAL_BAUD}")
 
-# 뒷정리
-cap.release()
-client_socket.close()
-dhtDevice.exit() # 센서도 깔끔하게 끕니다.
+            while True:
+                raw = ser.readline()
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                parse_stm32_line(line)
+
+        except Exception as e:
+            print(f"[CLIENT] STM32 연결 오류: {e} (1초 후 재시도)")
+            time.sleep(1)
+
+
+def connect_server() -> socket.socket:
+    while True:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((SERVER_IP, SERVER_PORT))
+            print(f"[CLIENT] 서버 연결됨: {SERVER_IP}:{SERVER_PORT}")
+            return sock
+        except Exception as e:
+            print(f"[CLIENT] 서버 연결 실패: {e} (1초 후 재시도)")
+            time.sleep(1)
+
+
+def send_clip(sock: socket.socket, frames: list[bytes], sensor_snapshot: dict):
+    meta = {
+        "event": "fall_detected",
+        "fps": FPS,
+        "width": FRAME_W,
+        "height": FRAME_H,
+        "seconds_before": SECONDS_BEFORE,
+        "seconds_after": SECONDS_AFTER,
+        "total_frames": len(frames),
+        "sensor": sensor_snapshot,
+        "client_ts": time.time(),
+    }
+    meta_bytes = json.dumps(meta, ensure_ascii=False).encode("utf-8")
+
+    sock.sendall(struct.pack("<BI", MSG_CLIP_START, len(meta_bytes)))
+    sock.sendall(meta_bytes)
+
+    for jpg in frames:
+        sock.sendall(struct.pack("<BI", MSG_FRAME, len(jpg)))
+        sock.sendall(jpg)
+
+    sock.sendall(struct.pack("<B", MSG_CLIP_END))
+
+
+def main():
+    threading.Thread(target=stm32_reader_thread, daemon=True).start()
+
+    cap = cv2.VideoCapture(CAM_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+    cap.set(cv2.CAP_PROP_FPS, FPS)
+
+    if not cap.isOpened():
+        print("[CLIENT] 카메라 열기 실패")
+        return
+
+    sock = connect_server()
+
+    before_buffer = deque(maxlen=MAX_FRAMES_BEFORE)
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("[CLIENT] 카메라 프레임 읽기 실패")
+                time.sleep(0.1)
+                continue
+
+            frame = cv2.resize(frame, (FRAME_W, FRAME_H))
+            ok, encoded = cv2.imencode(
+                ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+            )
+            if not ok:
+                continue
+
+            jpg = encoded.tobytes()
+            before_buffer.append(jpg)
+
+            # 이벤트 발생 시점: 10초 전 버퍼 + 10초 후 수집 후 전송
+            if pending_event.is_set():
+                pending_event.clear()
+
+                with sensor_lock:
+                    sensor_snapshot = dict(last_sensor)
+
+                print("[CLIENT] 이벤트 처리 시작: 10초 전 + 10초 후 클립 생성")
+
+                # before 버퍼가 부족하면 가장 오래된 프레임으로 앞을 채워서 항상 10초 고정
+                clip_frames = list(before_buffer)
+                if clip_frames and len(clip_frames) < MAX_FRAMES_BEFORE:
+                    pad = [clip_frames[0]] * (MAX_FRAMES_BEFORE - len(clip_frames))
+                    clip_frames = pad + clip_frames
+
+                # after 10초도 프레임 수 고정(수신 실패 시 마지막 프레임 복제)
+                last_good = clip_frames[-1] if clip_frames else jpg
+                after_collected = 0
+                while after_collected < MAX_FRAMES_AFTER:
+                    ret2, frame2 = cap.read()
+                    if ret2:
+                        frame2 = cv2.resize(frame2, (FRAME_W, FRAME_H))
+                        ok2, encoded2 = cv2.imencode(
+                            ".jpg", frame2, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+                        )
+                        if ok2:
+                            last_good = encoded2.tobytes()
+
+                    clip_frames.append(last_good)
+                    before_buffer.append(last_good)
+                    after_collected += 1
+
+                # 전체 길이(20초) 보장: 총 프레임 수를 정확히 맞춘다.
+                target_total = MAX_FRAMES_BEFORE + MAX_FRAMES_AFTER
+                if len(clip_frames) < target_total:
+                    clip_frames.extend([last_good] * (target_total - len(clip_frames)))
+                elif len(clip_frames) > target_total:
+                    clip_frames = clip_frames[-target_total:]
+
+                # 클립 전송 (실패시 재연결 후 재시도 1회)
+                sent = False
+                for _ in range(2):
+                    try:
+                        send_clip(sock, clip_frames, sensor_snapshot)
+                        sent = True
+                        break
+                    except Exception as e:
+                        print(f"[CLIENT] 클립 전송 실패: {e} -> 재연결")
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
+                        sock = connect_server()
+
+                if sent:
+                    print(f"[CLIENT] ✅ 클립 전송 완료 (frames={len(clip_frames)})")
+                else:
+                    print("[CLIENT] ❌ 클립 전송 최종 실패")
+
+    finally:
+        cap.release()
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
